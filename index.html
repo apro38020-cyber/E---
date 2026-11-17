@@ -1771,6 +1771,8 @@
             display: none !important;
         }
     </style>
+    <script src="https://www.gstatic.com/firebasejs/10.12.2/firebase-app-compat.js"></script>
+<script src="https://www.gstatic.com/firebasejs/10.12.2/firebase-database-compat.js"></script>
 </head>
 <body>
 
@@ -2565,7 +2567,7 @@
                 {
                     id: 'msg_2',
                     senderId: 4,
-                    text: 'Хто ще не поставив свій iPhone-стікер — натискайте на аватарку в шапці профілю 👍',
+                    text: 'Хто ще не поставив свій стікер — натискайте на аватарку в шапці профілю 👍',
                     time: '09:45',
                     reactions: { '😂': 4, '🤝': 5 }
                 }
@@ -2578,81 +2580,69 @@
             var dropdownHighlightIndex = -1;
             var rosterFilterMode = 'all';
 
-            /* Синхронізація з Firebase Realtime Database (якщо вказано databaseURL) */
-            var firebaseEndpoint = (FIREBASE_CONFIG && FIREBASE_CONFIG.databaseURL)
-                ? FIREBASE_CONFIG.databaseURL.replace(/\/+$/, '') + '/epp26_state.json'
-                : '';
+var liveDbRef = null;
+if (typeof firebase !== 'undefined' && FIREBASE_CONFIG && FIREBASE_CONFIG.databaseURL) {
+    if (!firebase.apps.length) {
+        firebase.initializeApp({ databaseURL: FIREBASE_CONFIG.databaseURL });
+    }
+    liveDbRef = firebase.database().ref('epp26_state');
+}
 
-            function updateSyncBadgeUI() {
-                var dot = document.getElementById('syncStatusDot');
-                var lbl = document.getElementById('syncStatusLabel');
-                if (firebaseEndpoint) {
-                    dot.classList.remove('is-local');
-                    lbl.textContent = 'Firebase • Live';
-                } else {
-                    dot.classList.add('is-local');
-                    lbl.textContent = 'GitHub • Live Ready';
-                }
-            }
+function updateSyncBadgeUI() {
+    var dot = document.getElementById('syncStatusDot');
+    var lbl = document.getElementById('syncStatusLabel');
+    if (liveDbRef) {
+        dot.classList.remove('is-local');
+        lbl.textContent = 'Firebase • Live';
+    } else {
+        dot.classList.add('is-local');
+        lbl.textContent = 'GitHub • Live Ready';
+    }
+}
 
-            function pushStateToFirebase() {
-                if (!firebaseEndpoint) return;
-                try {
-                    fetch(firebaseEndpoint, {
-                        method: 'PUT',
-                        headers: { 'Content-Type': 'application/json' },
-                        body: JSON.stringify({
-                            customRoles: customRoles,
-                            customStickers: customStickers,
-                            announcements: announcements,
-                            homeworkMap: homeworkMap,
-                            chatMessages: chatMessages,
-                            pinnedChatMsg: pinnedChatMsg
-                        })
-                    }).catch(function () {});
-                } catch (e) {}
-            }
+function pushStateToFirebase() {
+    if (!liveDbRef) return;
+    liveDbRef.set({
+        customRoles: customRoles,
+        customStickers: customStickers,
+        announcements: announcements,
+        homeworkMap: homeworkMap,
+        chatMessages: chatMessages,
+        pinnedChatMsg: pinnedChatMsg
+    }).catch(function () {});
+}
 
-            function pullStateFromFirebase() {
-                if (!firebaseEndpoint) return;
-                try {
-                    fetch(firebaseEndpoint)
-                        .then(function (r) { return r.ok ? r.json() : null; })
-                        .then(function (data) {
-                            if (!data || typeof data !== 'object') return;
-                            if (data.customRoles) customRoles = data.customRoles;
-                            if (data.customStickers) customStickers = data.customStickers;
-                            if (Array.isArray(data.announcements)) announcements = data.announcements;
-                            if (data.homeworkMap) homeworkMap = data.homeworkMap;
-                            if (Array.isArray(data.chatMessages)) chatMessages = data.chatMessages;
-                            if (typeof data.pinnedChatMsg === 'string') pinnedChatMsg = data.pinnedChatMsg;
-                            saveLocalOnly();
-                            if (currentUser) renderDashboard();
-                        })
-                        .catch(function () {});
-                } catch (e) {}
-            }
+function saveLocalOnly() {
+    safeStorage.setJSON(STORAGE_KEYS.PASSWORDS, customPasswords);
+    safeStorage.setJSON(STORAGE_KEYS.ROLES, customRoles);
+    safeStorage.setJSON(STORAGE_KEYS.STICKERS, customStickers);
+    safeStorage.setJSON(STORAGE_KEYS.ANNS, announcements);
+    safeStorage.setJSON(STORAGE_KEYS.HW, homeworkMap);
+    safeStorage.setJSON(STORAGE_KEYS.CHAT, chatMessages);
+    safeStorage.set(STORAGE_KEYS.PIN, pinnedChatMsg);
+    safeStorage.setJSON(STORAGE_KEYS.PHOTOS, studentPhotos);
+}
 
-            function saveLocalOnly() {
-                safeStorage.setJSON(STORAGE_KEYS.PASSWORDS, customPasswords);
-                safeStorage.setJSON(STORAGE_KEYS.ROLES, customRoles);
-                safeStorage.setJSON(STORAGE_KEYS.STICKERS, customStickers);
-                safeStorage.setJSON(STORAGE_KEYS.ANNS, announcements);
-                safeStorage.setJSON(STORAGE_KEYS.HW, homeworkMap);
-                safeStorage.setJSON(STORAGE_KEYS.CHAT, chatMessages);
-                safeStorage.set(STORAGE_KEYS.PIN, pinnedChatMsg);
-                safeStorage.setJSON(STORAGE_KEYS.PHOTOS, studentPhotos);
-            }
+function saveAllState() {
+    saveLocalOnly();
+    pushStateToFirebase();
+}
 
-            function saveAllState() {
-                saveLocalOnly();
-                pushStateToFirebase();
-            }
-
-            if (firebaseEndpoint) {
-                pullStateFromFirebase();
-                setInterval(pullStateFromFirebase, 5000);
-            }
+if (liveDbRef) {
+    liveDbRef.on('value', function (snapshot) {
+        var data = snapshot.val();
+        if (!data || typeof data !== 'object') return;
+        if (data.customRoles) customRoles = data.customRoles;
+        if (data.customStickers) customStickers = data.customStickers;
+        if (Array.isArray(data.announcements)) announcements = data.announcements;
+        if (data.homeworkMap) homeworkMap = data.homeworkMap;
+        if (Array.isArray(data.chatMessages)) chatMessages = data.chatMessages;
+        if (typeof data.pinnedChatMsg === 'string') pinnedChatMsg = data.pinnedChatMsg;
+        saveLocalOnly();
+        if (currentUser) renderDashboard();
+    });
+}
+            
 
             /* Допоміжні гетери */
             function getRole(studentId) {
