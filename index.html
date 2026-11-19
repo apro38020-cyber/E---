@@ -612,8 +612,25 @@
       width: 7px;
       height: 7px;
       border-radius: 50%;
+      background: var(--accent-amber);
+      box-shadow: 0 0 8px var(--accent-amber);
+      transition: background 0.25s ease, box-shadow 0.25s ease;
+      flex-shrink: 0;
+    }
+
+    .live-dot.is-online {
       background: var(--accent-green);
       box-shadow: 0 0 8px var(--accent-green);
+    }
+
+    .live-dot.is-connecting {
+      background: var(--accent-amber);
+      box-shadow: 0 0 8px var(--accent-amber);
+    }
+
+    .live-dot.is-local {
+      background: #9898a2;
+      box-shadow: none;
     }
 
     .icon-circle-btn {
@@ -1477,6 +1494,10 @@
         padding: 5px 11px;
         font-size: 11px;
       }
+
+      .live-verbose {
+        display: none;
+      }
     }
   </style>
 </head>
@@ -1582,17 +1603,20 @@
       <!-- 4. Синхронізація -->
       <div id="set-pane-sync" class="set-pane" style="display: none;">
         <div style="padding: 14px 16px; border-radius: 18px; background: var(--bg-elevated); border: 1px solid var(--border-hairline); margin-bottom: 16px;">
-          <div style="display: flex; align-items: center; gap: 8px; margin-bottom: 4px;">
-            <span class="live-dot"></span>
-            <strong style="font-size: 14px;">Стан синхронізації</strong>
+          <div style="display: flex; align-items: center; justify-content: space-between; gap: 8px; flex-wrap: wrap; margin-bottom: 6px;">
+            <div style="display: flex; align-items: center; gap: 8px;">
+              <span id="sync-panel-dot" class="live-dot is-connecting"></span>
+              <strong id="sync-panel-headline" style="font-size: 14px;">Синхронізація в реальному часі</strong>
+            </div>
+            <span id="sync-online-pill" class="role-pill role-student">Онлайн: 1</span>
           </div>
           <p id="sync-status-desc" style="font-size: 12px; color: var(--text-secondary);">
-            Локальна синхронізація між вкладками активна. Підключіть Firebase Realtime Database нижче для миттєвого обміну даними між усіма пристроями групи.
+            Підключення до хмарного каналу групи ЕПП 26 2/9 (MQTT WSS + BroadcastChannel)...
           </p>
         </div>
 
         <div style="margin-bottom: 16px;">
-          <label class="field-caption" for="firebase-db-url">Firebase Realtime Database URL</label>
+          <label class="field-caption" for="firebase-db-url">Власна база Firebase Realtime Database URL (необов'язково)</label>
           <div style="display: flex; gap: 10px; flex-wrap: wrap;">
             <input
               id="firebase-db-url"
@@ -1606,7 +1630,7 @@
         </div>
 
         <div style="display: flex; gap: 10px; flex-wrap: wrap; border-top: 1px solid var(--border-hairline); padding-top: 16px;">
-          <button type="button" class="pill-btn-ghost" data-action="manual-sync">🔄 Оновити зараз</button>
+          <button type="button" class="pill-btn" data-action="manual-sync">🔄 Синхронізувати зараз</button>
           <button type="button" class="pill-btn-ghost" data-action="export-json">⬇️ Експорт JSON</button>
           <label class="pill-btn-ghost" style="cursor: pointer;">
             ⬆️ Імпорт JSON
@@ -1774,11 +1798,13 @@
 
         <!-- Right Controls -->
         <div class="header-actions">
-          <div class="live-pill hide-on-mobile" title="Синхронізація у реальному часі">
-            <span id="hdr-live-dot" class="live-dot"></span>
-            <span>Live</span>
+          <div id="hdr-live-pill" class="live-pill" title="Синхронізація у реальному часі між ПК та телефонами">
+            <span id="hdr-live-dot" class="live-dot is-connecting"></span>
+            <span id="hdr-live-text">Live</span>
+            <span id="hdr-live-sub" class="live-verbose">• Підключення...</span>
+            <span id="hdr-online-count" style="opacity: 0.85;">(1)</span>
           </div>
-          <button type="button" class="icon-circle-btn" data-action="open-settings" data-stab="profile" title="Налаштування">⚙️</button>
+          <button type="button" class="icon-circle-btn hide-on-mobile" data-action="open-settings" data-stab="profile" title="Налаштування">⚙️</button>
           <button id="hdr-theme-btn" type="button" class="icon-circle-btn" data-action="toggle-theme" title="Змінити тему">🌙</button>
           <button type="button" class="pill-btn-ghost" style="padding: 8px 14px; font-size: 12px;" data-action="logout">Вийти</button>
         </div>
@@ -2414,20 +2440,51 @@
     };
 
     /* ==========================================================================
-       2. REAL-TIME SYNC ENGINE (BROADCASTCHANNEL + FIREBASE RTDB REST POLL/PUSH)
+       2. HYBRID REAL-TIME SYNC ENGINE (BUILT-IN MQTT 3.1.1 WSS + FIREBASE + BC)
        ========================================================================== */
-    const SyncService = {
+    const SyncEngine = {
+      STATE_KEY: 'egruppa_epp26_v3_state',
+      URL_KEY: 'egruppa_epp26_v3_fb_url',
+      BROKERS: [
+        'wss://broker.emqx.io:8084/mqtt',
+        'wss://broker.hivemq.com:8884/mqtt'
+      ],
+      TOPIC_BASE: 'zetfk/epp26_2_9_live_v1',
+      TOPIC_SNAPSHOT: 'zetfk/epp26_2_9_live_v1/snapshot',
+      TOPIC_OPS: 'zetfk/epp26_2_9_live_v1/ops',
+      TOPIC_PRESENCE: 'zetfk/epp26_2_9_live_v1/presence',
+
+      clientId: 'epp26_' + Math.random().toString(36).slice(2, 10) + '_' + Date.now().toString(36),
+      brokerIdx: 0,
+      ws: null,
+      connected: false,
+      statusMode: 'connecting', // 'online' | 'connecting' | 'local'
+      statusLabel: 'Підключення...',
+      rxBuf: new Uint8Array(0),
+      pingTimer: null,
+      presenceTimer: null,
+      reconnectTimer: null,
+      snapshotDebounce: null,
+      initialSnapshotTimer: null,
+      receivedRetainedSnapshot: false,
+      seenOps: new Set(),
+      peers: new Map(),
       bc: null,
-      timer: null,
-      STATE_KEY: 'egruppa_epp26_v2_state',
-      URL_KEY: 'egruppa_epp26_v2_fb_url',
+      fbEventSource: null,
+      fbPollTimer: null,
+      encoder: new TextEncoder(),
+      decoder: new TextDecoder(),
 
       init() {
+        // 1. Local multi-tab BroadcastChannel + storage listener
         try {
           if ('BroadcastChannel' in window) {
-            this.bc = new BroadcastChannel('egruppa_epp26_v2_channel');
+            this.bc = new BroadcastChannel('epp26_sync');
             this.bc.onmessage = (ev) => {
-              if (ev.data && ev.data.type === 'SYNC_PULSE') {
+              if (!ev.data) return;
+              if (ev.data.type === 'OP' && ev.data.op) {
+                this.handleIncomingOp(ev.data.op, false);
+              } else if (ev.data.type === 'STATE_SYNC') {
                 App.loadState();
                 App.renderAll();
               }
@@ -2442,9 +2499,392 @@
           }
         });
 
-        this.startPolling();
+        window.addEventListener('beforeunload', () => {
+          this.publishPresence(false);
+        });
+
+        // 2. Connect built-in MQTT 3.1.1 over Secure WebSockets out-of-the-box
+        this.connectMqtt();
+
+        // 3. Optional Firebase RTDB SSE / REST if configured
+        this.initFirebaseStream();
       },
 
+      /* --- Binary MQTT 3.1.1 Packet Helpers --- */
+      encodeString(str) {
+        const bytes = this.encoder.encode(String(str));
+        const out = new Uint8Array(2 + bytes.length);
+        out[0] = (bytes.length >> 8) & 0xff;
+        out[1] = bytes.length & 0xff;
+        out.set(bytes, 2);
+        return out;
+      },
+
+      encodeRemainingLength(len) {
+        const bytes = [];
+        do {
+          let digit = len % 128;
+          len = Math.floor(len / 128);
+          if (len > 0) digit |= 0x80;
+          bytes.push(digit);
+        } while (len > 0);
+        return new Uint8Array(bytes);
+      },
+
+      concatBytes(arrays) {
+        let total = 0;
+        for (const a of arrays) total += a.length;
+        const out = new Uint8Array(total);
+        let offset = 0;
+        for (const a of arrays) {
+          out.set(a, offset);
+          offset += a.length;
+        }
+        return out;
+      },
+
+      buildConnectPacket() {
+        // Protocol Name "MQTT" (0x00 0x04 'M' 'Q' 'T' 'T'), Level 4 (3.1.1)
+        // Flags: 0x06 (Clean Session = 1, Will Flag = 1, Will QoS = 0, Will Retain = 0)
+        // Keep Alive: 60s (0x00 0x3C)
+        const varHeader = new Uint8Array([
+          0x00, 0x04, 0x4d, 0x51, 0x54, 0x54,
+          0x04,
+          0x06,
+          0x00, 0x3c
+        ]);
+        const willPayload = JSON.stringify({
+          clientId: this.clientId,
+          online: false,
+          ts: Date.now()
+        });
+        const payload = this.concatBytes([
+          this.encodeString(this.clientId),
+          this.encodeString(this.TOPIC_PRESENCE),
+          this.encodeString(willPayload)
+        ]);
+        const remLen = this.encodeRemainingLength(varHeader.length + payload.length);
+        return this.concatBytes([new Uint8Array([0x10]), remLen, varHeader, payload]);
+      },
+
+      buildSubscribePacket(topicFilter, packetId = 1) {
+        const varHeader = new Uint8Array([(packetId >> 8) & 0xff, packetId & 0xff]);
+        const payload = this.concatBytes([this.encodeString(topicFilter), new Uint8Array([0x00])]);
+        const remLen = this.encodeRemainingLength(varHeader.length + payload.length);
+        return this.concatBytes([new Uint8Array([0x82]), remLen, varHeader, payload]);
+      },
+
+      buildPublishPacket(topic, objPayload, retain = false) {
+        const topicBytes = this.encodeString(topic);
+        const bodyBytes = this.encoder.encode(
+          typeof objPayload === 'string' ? objPayload : JSON.stringify(objPayload)
+        );
+        const fixedByte = 0x30 | (retain ? 0x01 : 0x00);
+        const remLen = this.encodeRemainingLength(topicBytes.length + bodyBytes.length);
+        return this.concatBytes([new Uint8Array([fixedByte]), remLen, topicBytes, bodyBytes]);
+      },
+
+      connectMqtt() {
+        if (this.reconnectTimer) {
+          clearTimeout(this.reconnectTimer);
+          this.reconnectTimer = null;
+        }
+        if (this.ws) {
+          try { this.ws.close(); } catch (e) {}
+          this.ws = null;
+        }
+
+        const url = this.BROKERS[this.brokerIdx % this.BROKERS.length];
+        this.setStatus('connecting', 'Підключення...');
+
+        try {
+          const ws = new WebSocket(url, 'mqtt');
+          ws.binaryType = 'arraybuffer';
+          this.ws = ws;
+          this.rxBuf = new Uint8Array(0);
+
+          const connectTimeout = setTimeout(() => {
+            if (!this.connected && this.ws === ws) {
+              try { ws.close(); } catch (e) {}
+            }
+          }, 7000);
+
+          ws.onopen = () => {
+            ws.send(this.buildConnectPacket());
+          };
+
+          ws.onmessage = (ev) => {
+            if (!(ev.data instanceof ArrayBuffer)) return;
+            const chunk = new Uint8Array(ev.data);
+            this.rxBuf = this.concatBytes([this.rxBuf, chunk]);
+            this.drainRxBuffer(connectTimeout);
+          };
+
+          ws.onerror = () => {};
+
+          ws.onclose = () => {
+            clearTimeout(connectTimeout);
+            const wasConnected = this.connected;
+            this.connected = false;
+            this.stopTimers();
+            this.setStatus('local', 'Локально (перепідключення...)');
+            if (!wasConnected) {
+              this.brokerIdx = (this.brokerIdx + 1) % this.BROKERS.length;
+            }
+            this.reconnectTimer = setTimeout(() => this.connectMqtt(), 3500);
+          };
+        } catch (err) {
+          this.setStatus('local', 'Локально');
+          this.brokerIdx = (this.brokerIdx + 1) % this.BROKERS.length;
+          this.reconnectTimer = setTimeout(() => this.connectMqtt(), 5000);
+        }
+      },
+
+      drainRxBuffer(connectTimeout) {
+        while (this.rxBuf.length >= 2) {
+          const headerByte = this.rxBuf[0];
+          let multiplier = 1;
+          let remLen = 0;
+          let idx = 1;
+          let digit = 0;
+          let completeHeader = true;
+
+          do {
+            if (idx >= this.rxBuf.length) {
+              completeHeader = false;
+              break;
+            }
+            digit = this.rxBuf[idx++];
+            remLen += (digit & 127) * multiplier;
+            multiplier *= 128;
+          } while ((digit & 128) !== 0);
+
+          if (!completeHeader || this.rxBuf.length < idx + remLen) {
+            break; // Wait for remaining TCP/WS bytes
+          }
+
+          const payload = this.rxBuf.subarray(idx, idx + remLen);
+          this.rxBuf = this.rxBuf.subarray(idx + remLen);
+
+          const pktType = headerByte & 0xf0;
+          if (pktType === 0x20) {
+            // CONNACK
+            clearTimeout(connectTimeout);
+            if (payload.length >= 2 && payload[1] === 0x00) {
+              this.onMqttConnected();
+            }
+          } else if (pktType === 0x30) {
+            // PUBLISH
+            this.handleMqttPublish(headerByte, payload);
+          }
+        }
+      },
+
+      onMqttConnected() {
+        this.connected = true;
+        this.receivedRetainedSnapshot = false;
+        this.peers.set(this.clientId, {
+          uid: App.currentUserId,
+          name: App.currentUserId ? App.me().name : 'Гість',
+          ts: Date.now()
+        });
+        this.setStatus('online', 'В мережі');
+
+        // Subscribe to all group topics (snapshot, ops, presence)
+        this.ws.send(this.buildSubscribePacket(`${this.TOPIC_BASE}/#`, 1));
+
+        // Announce presence immediately and heartbeat every 20s
+        this.publishPresence(true);
+        this.presenceTimer = setInterval(() => {
+          this.prunePeers();
+          this.publishPresence(true);
+        }, 20000);
+
+        // Keep-alive PINGREQ every 25s
+        this.pingTimer = setInterval(() => {
+          if (this.ws && this.ws.readyState === WebSocket.OPEN) {
+            this.ws.send(new Uint8Array([0xc0, 0x00]));
+          }
+        }, 25000);
+
+        // If broker has no retained snapshot after 1.8s, seed it with our current state
+        if (this.initialSnapshotTimer) clearTimeout(this.initialSnapshotTimer);
+        this.initialSnapshotTimer = setTimeout(() => {
+          if (!this.receivedRetainedSnapshot && this.connected) {
+            this.publishSnapshot();
+          }
+        }, 1800);
+      },
+
+      stopTimers() {
+        if (this.pingTimer) { clearInterval(this.pingTimer); this.pingTimer = null; }
+        if (this.presenceTimer) { clearInterval(this.presenceTimer); this.presenceTimer = null; }
+        if (this.initialSnapshotTimer) { clearTimeout(this.initialSnapshotTimer); this.initialSnapshotTimer = null; }
+      },
+
+      handleMqttPublish(headerByte, payload) {
+        if (payload.length < 2) return;
+        const qos = (headerByte >> 1) & 0x03;
+        const isRetain = (headerByte & 0x01) === 1;
+        const topicLen = (payload[0] << 8) | payload[1];
+        if (payload.length < 2 + topicLen) return;
+
+        const topic = this.decoder.decode(payload.subarray(2, 2 + topicLen));
+        let pos = 2 + topicLen;
+        if (qos > 0) pos += 2;
+        const rawText = this.decoder.decode(payload.subarray(pos));
+
+        let data = null;
+        try {
+          data = JSON.parse(rawText);
+        } catch (e) {
+          return;
+        }
+        if (!data || typeof data !== 'object') return;
+
+        if (topic === this.TOPIC_PRESENCE) {
+          this.handlePresenceMessage(data);
+        } else if (topic === this.TOPIC_OPS) {
+          this.handleIncomingOp(data, true);
+        } else if (topic === this.TOPIC_SNAPSHOT) {
+          this.receivedRetainedSnapshot = true;
+          this.handleIncomingSnapshot(data, isRetain);
+        }
+      },
+
+      /* --- Presence & Online Counter --- */
+      publishPresence(online = true) {
+        this.peers.set(this.clientId, {
+          uid: App.currentUserId,
+          name: App.currentUserId ? App.me().name : 'Гість',
+          ts: Date.now()
+        });
+        if (!online) this.peers.delete(this.clientId);
+        this.updateStatusUI();
+
+        if (this.ws && this.ws.readyState === WebSocket.OPEN) {
+          const msg = {
+            clientId: this.clientId,
+            uid: App.currentUserId || null,
+            name: App.currentUserId ? App.me().name : 'Гість',
+            online,
+            ts: Date.now()
+          };
+          this.ws.send(this.buildPublishPacket(this.TOPIC_PRESENCE, msg, false));
+        }
+      },
+
+      handlePresenceMessage(msg) {
+        if (!msg.clientId || msg.clientId === this.clientId) return;
+        if (msg.online === false) {
+          this.peers.delete(msg.clientId);
+        } else {
+          this.peers.set(msg.clientId, {
+            uid: msg.uid || null,
+            name: msg.name || 'Студент',
+            ts: Date.now()
+          });
+        }
+        this.prunePeers();
+        this.updateStatusUI();
+      },
+
+      prunePeers() {
+        const now = Date.now();
+        for (const [cid, info] of this.peers.entries()) {
+          if (cid !== this.clientId && now - info.ts > 55000) {
+            this.peers.delete(cid);
+          }
+        }
+      },
+
+      onlineCount() {
+        this.prunePeers();
+        return Math.max(1, this.peers.size);
+      },
+
+      /* --- Atomic Operations + Retained Snapshot Merging --- */
+      broadcastOp(type, payload) {
+        const op = {
+          opId: this.clientId + '_' + Date.now() + '_' + Math.random().toString(36).slice(2, 6),
+          sender: this.clientId,
+          type,
+          payload,
+          ts: Date.now()
+        };
+        this.rememberOp(op.opId);
+
+        // 1. Broadcast to other local tabs
+        try {
+          if (this.bc) this.bc.postMessage({ type: 'OP', op });
+        } catch (e) {}
+
+        // 2. Publish atomic op over MQTT WSS
+        if (this.ws && this.ws.readyState === WebSocket.OPEN) {
+          this.ws.send(this.buildPublishPacket(this.TOPIC_OPS, op, false));
+        }
+
+        // 3. Schedule retained snapshot update so newcomers get latest state
+        this.scheduleSnapshotPublish();
+      },
+
+      rememberOp(opId) {
+        this.seenOps.add(opId);
+        if (this.seenOps.size > 600) {
+          const first = this.seenOps.values().next().value;
+          this.seenOps.delete(first);
+        }
+      },
+
+      handleIncomingOp(op, fromNetwork) {
+        if (!op || !op.opId || op.sender === this.clientId) return;
+        if (this.seenOps.has(op.opId)) return;
+        this.rememberOp(op.opId);
+
+        const changed = App.applyAtomicOp(op);
+        if (changed) {
+          SafeStorage.set(this.STATE_KEY, App.state);
+          App.renderAll();
+          if (fromNetwork && this.bc) {
+            try { this.bc.postMessage({ type: 'STATE_SYNC' }); } catch (e) {}
+          }
+        }
+      },
+
+      scheduleSnapshotPublish() {
+        if (this.snapshotDebounce) clearTimeout(this.snapshotDebounce);
+        this.snapshotDebounce = setTimeout(() => {
+          this.publishSnapshot();
+        }, 350);
+      },
+
+      publishSnapshot() {
+        if (!App.state) return;
+        const packetState = {
+          ...App.state,
+          _sender: this.clientId
+        };
+        if (this.ws && this.ws.readyState === WebSocket.OPEN) {
+          this.ws.send(this.buildPublishPacket(this.TOPIC_SNAPSHOT, packetState, true));
+        }
+        this.pushFirebase(App.state);
+      },
+
+      handleIncomingSnapshot(remote) {
+        if (!remote || remote._sender === this.clientId) return;
+        if (!Array.isArray(remote.students) || remote.students.length !== 23) return;
+
+        const merged = App.mergeRemoteState(remote);
+        if (merged) {
+          SafeStorage.set(this.STATE_KEY, App.state);
+          App.renderAll();
+          if (this.bc) {
+            try { this.bc.postMessage({ type: 'STATE_SYNC' }); } catch (e) {}
+          }
+        }
+      },
+
+      /* --- Optional Firebase Realtime Database (SSE + REST) --- */
       getUrl() {
         const u = SafeStorage.get(this.URL_KEY, '');
         return typeof u === 'string' ? u.trim().replace(/\/+$/, '') : '';
@@ -2452,15 +2892,49 @@
 
       setUrl(url) {
         SafeStorage.set(this.URL_KEY, url.trim().replace(/\/+$/, ''));
+        this.initFirebaseStream();
       },
 
-      notifyTabs() {
+      initFirebaseStream() {
+        if (this.fbEventSource) {
+          try { this.fbEventSource.close(); } catch (e) {}
+          this.fbEventSource = null;
+        }
+        if (this.fbPollTimer) {
+          clearInterval(this.fbPollTimer);
+          this.fbPollTimer = null;
+        }
+
+        const base = this.getUrl();
+        if (!base) return;
+
         try {
-          if (this.bc) this.bc.postMessage({ type: 'SYNC_PULSE', ts: Date.now() });
-        } catch (e) {}
+          const es = new EventSource(`${base}/epp26_portal_state.json`);
+          this.fbEventSource = es;
+          const onSseData = (ev) => {
+            try {
+              const parsed = JSON.parse(ev.data);
+              const payload = parsed && parsed.data ? parsed.data : parsed;
+              if (payload && Array.isArray(payload.students)) {
+                this.handleIncomingSnapshot(payload);
+              }
+            } catch (e) {}
+          };
+          es.addEventListener('put', onSseData);
+          es.addEventListener('patch', onSseData);
+          es.onerror = () => {
+            try { es.close(); } catch (e) {}
+            this.fbEventSource = null;
+            if (!this.fbPollTimer) {
+              this.fbPollTimer = setInterval(() => this.pullFirebase(true), 6000);
+            }
+          };
+        } catch (e) {
+          this.fbPollTimer = setInterval(() => this.pullFirebase(true), 6000);
+        }
       },
 
-      async push(stateObj) {
+      async pushFirebase(stateObj) {
         const base = this.getUrl();
         if (!base) return;
         try {
@@ -2469,49 +2943,73 @@
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify(stateObj)
           });
-          this.setDotState(true, 'Хмарна синхронізація активна');
-        } catch (e) {
-          this.setDotState(false, 'Помилка відправки у хмару');
-        }
+        } catch (e) {}
       },
 
-      async pull(silent = true) {
+      async pullFirebase(silent = true) {
         const base = this.getUrl();
         if (!base) return false;
         try {
           const res = await fetch(`${base}/epp26_portal_state.json`);
           if (!res.ok) throw new Error('HTTP ' + res.status);
           const remote = await res.json();
-          if (remote && remote.updatedAt && remote.updatedAt > (App.state.updatedAt || 0)) {
-            App.state = remote;
-            SafeStorage.set(this.STATE_KEY, App.state);
-            App.renderAll();
-            if (!silent) Toast.show('Дані синхронізовано з хмарою', '☁️');
+          if (remote && Array.isArray(remote.students)) {
+            this.handleIncomingSnapshot(remote);
+            if (!silent) Toast.show('Дані синхронізовано з Firebase', '☁️');
           }
-          this.setDotState(true, 'Хмарна синхронізація активна');
           return true;
         } catch (e) {
-          this.setDotState(false, 'Не вдалося підключитися до бази');
           return false;
         }
       },
 
-      startPolling() {
-        if (this.timer) clearInterval(this.timer);
-        this.timer = setInterval(() => {
-          if (this.getUrl()) this.pull(true);
-        }, 6000);
+      /* --- Status UI Helpers --- */
+      setStatus(mode, label) {
+        this.statusMode = mode;
+        this.statusLabel = label;
+        this.updateStatusUI();
       },
 
-      setDotState(ok, msg) {
-        const dot = document.getElementById('hdr-live-dot');
-        const desc = document.getElementById('sync-status-desc');
-        if (dot) {
-          dot.style.background = ok ? 'var(--accent-green)' : 'var(--accent-amber)';
-          dot.style.boxShadow = ok ? '0 0 8px var(--accent-green)' : '0 0 8px var(--accent-amber)';
+      updateStatusUI() {
+        const count = this.onlineCount();
+        const hdrDot = document.getElementById('hdr-live-dot');
+        const hdrSub = document.getElementById('hdr-live-sub');
+        const hdrCnt = document.getElementById('hdr-online-count');
+
+        if (hdrDot) {
+          hdrDot.className = `live-dot is-${this.statusMode}`;
         }
-        if (desc && this.getUrl()) {
-          desc.textContent = `${msg} | ${this.getUrl()}`;
+        if (hdrSub) {
+          hdrSub.textContent = `• ${this.statusLabel}`;
+        }
+        if (hdrCnt) {
+          hdrCnt.textContent = `(${count})`;
+        }
+
+        const panelDot = document.getElementById('sync-panel-dot');
+        const panelHead = document.getElementById('sync-panel-headline');
+        const panelOnline = document.getElementById('sync-online-pill');
+        const panelDesc = document.getElementById('sync-status-desc');
+
+        if (panelDot) {
+          panelDot.className = `live-dot is-${this.statusMode}`;
+        }
+        if (panelHead) {
+          panelHead.textContent =
+            this.statusMode === 'online'
+              ? '🟢 Live • В мережі (Синхронізовано)'
+              : this.statusMode === 'connecting'
+                ? '🟡 Підключення до каналу групи...'
+                : '⚪ Локальний режим (очікування мережі)';
+        }
+        if (panelOnline) {
+          panelOnline.textContent = `Онлайн зараз: ${count}`;
+        }
+        if (panelDesc) {
+          const fb = this.getUrl();
+          panelDesc.textContent = fb
+            ? `Активний хмарний канал групи + Firebase RTDB (${fb}).`
+            : 'Автоматична синхронізація між усіма ПК та телефонами групи ЕПП 26 2/9 активна без налаштування ключів.';
         }
       }
     };
@@ -2995,12 +3493,14 @@
 
       buildSeedState() {
         return {
-          updatedAt: Date.now(),
+          updatedAt: 1700000000000,
+          deletedIds: [],
           students: INITIAL_STUDENTS.map(s => ({
             ...s,
             password: String(s.id),
             status: 'Група ЕПП 26 2/9 | ЗЕТФК',
-            photo: null
+            photo: null,
+            updatedAt: 1700000000000
           })),
           homework: {
             '0_2': 'Опрацювати біографію та конспект твору',
@@ -3045,7 +3545,7 @@
               {
                 id: 'msg_2',
                 userId: 18,
-                text: 'Додав об’ємні 3D-стікери, журнал відвідуваності (Був / Не був / ПП) та синхронізацію у налаштуваннях 💻',
+                text: 'Додав об’ємні 3D-стікери, журнал відвідуваності (Був / Не був / ПП) та миттєву синхронізацію між усіма пристроями 💻',
                 time: '09:18',
                 reactions: { '👑': [17], '🔥': [4] },
                 pinned: false
@@ -3060,20 +3560,179 @@
       },
 
       loadState() {
-        const stored = SafeStorage.get(SyncService.STATE_KEY, null);
+        const stored = SafeStorage.get(SyncEngine.STATE_KEY, null);
         if (stored && Array.isArray(stored.students) && stored.students.length === 23) {
+          if (!Array.isArray(stored.deletedIds)) stored.deletedIds = [];
           this.state = stored;
         } else {
           this.state = this.buildSeedState();
-          SafeStorage.set(SyncService.STATE_KEY, this.state);
+          SafeStorage.set(SyncEngine.STATE_KEY, this.state);
         }
       },
 
-      saveState() {
+      saveState(opType = null, opPayload = null) {
         this.state.updatedAt = Date.now();
-        SafeStorage.set(SyncService.STATE_KEY, this.state);
-        SyncService.notifyTabs();
-        SyncService.push(this.state);
+        SafeStorage.set(SyncEngine.STATE_KEY, this.state);
+        if (opType) {
+          SyncEngine.broadcastOp(opType, opPayload);
+        } else {
+          SyncEngine.scheduleSnapshotPublish();
+        }
+      },
+
+      trackDeleted(id) {
+        if (!Array.isArray(this.state.deletedIds)) this.state.deletedIds = [];
+        if (!this.state.deletedIds.includes(id)) {
+          this.state.deletedIds.push(id);
+          if (this.state.deletedIds.length > 250) {
+            this.state.deletedIds = this.state.deletedIds.slice(-250);
+          }
+        }
+      },
+
+      applyAtomicOp(op) {
+        const { type, payload } = op;
+        if (!payload) return false;
+
+        switch (type) {
+          case 'CHAT_ADD': {
+            const { channel, message } = payload;
+            if (!channel || !message || !message.id) return false;
+            if (!this.state.messages[channel]) this.state.messages[channel] = [];
+            if (this.state.messages[channel].some(m => m.id === message.id)) return false;
+            this.state.messages[channel].push(message);
+            return true;
+          }
+          case 'CHAT_DELETE': {
+            const { channel, msgId } = payload;
+            if (!channel || !msgId || !this.state.messages[channel]) return false;
+            this.trackDeleted(msgId);
+            const before = this.state.messages[channel].length;
+            this.state.messages[channel] = this.state.messages[channel].filter(m => m.id !== msgId);
+            return this.state.messages[channel].length !== before;
+          }
+          case 'CHAT_REACT': {
+            const { channel, msgId, reactions } = payload;
+            const m = (this.state.messages[channel] || []).find(x => x.id === msgId);
+            if (!m) return false;
+            m.reactions = reactions || {};
+            return true;
+          }
+          case 'CHAT_PIN': {
+            const { channel, msgId, pinned } = payload;
+            const msgs = this.state.messages[channel] || [];
+            msgs.forEach(x => { x.pinned = false; });
+            const target = msgs.find(x => x.id === msgId);
+            if (target) target.pinned = Boolean(pinned);
+            return true;
+          }
+          case 'ANN_ADD': {
+            const { announcement } = payload;
+            if (!announcement || !announcement.id) return false;
+            if (this.state.announcements.some(a => a.id === announcement.id)) return false;
+            this.state.announcements.unshift(announcement);
+            return true;
+          }
+          case 'ANN_DELETE': {
+            const { id } = payload;
+            if (!id) return false;
+            this.trackDeleted(id);
+            const before = this.state.announcements.length;
+            this.state.announcements = this.state.announcements.filter(a => a.id !== id);
+            return this.state.announcements.length !== before;
+          }
+          case 'HW_SET': {
+            const { hwKey, text } = payload;
+            if (!hwKey) return false;
+            if (text) this.state.homework[hwKey] = text;
+            else delete this.state.homework[hwKey];
+            return true;
+          }
+          case 'ATT_SET': {
+            const { attKey, uid, status } = payload;
+            if (!attKey || !uid) return false;
+            if (!this.state.attendance[attKey]) this.state.attendance[attKey] = {};
+            if (status) this.state.attendance[attKey][uid] = status;
+            else delete this.state.attendance[attKey][uid];
+            return true;
+          }
+          case 'ATT_BULK': {
+            const { attKey, records } = payload;
+            if (!attKey) return false;
+            if (records) this.state.attendance[attKey] = records;
+            else delete this.state.attendance[attKey];
+            return true;
+          }
+          case 'STUDENT_PATCH': {
+            const { uid, patch } = payload;
+            const st = this.state.students.find(s => s.id === uid);
+            if (!st || !patch) return false;
+            Object.assign(st, patch);
+            return true;
+          }
+          default:
+            return false;
+        }
+      },
+
+      mergeRemoteState(remote) {
+        let changed = false;
+        const delSet = new Set([
+          ...(this.state.deletedIds || []),
+          ...(remote.deletedIds || [])
+        ]);
+        this.state.deletedIds = Array.from(delSet).slice(-250);
+
+        // Merge students individually by updatedAt
+        remote.students.forEach(rSt => {
+          const lSt = this.state.students.find(s => s.id === rSt.id);
+          if (lSt && (rSt.updatedAt || 0) > (lSt.updatedAt || 0)) {
+            Object.assign(lSt, rSt);
+            changed = true;
+          }
+        });
+
+        // Merge announcements by id
+        const annMap = new Map();
+        [...(remote.announcements || []), ...(this.state.announcements || [])].forEach(a => {
+          if (a && a.id && !delSet.has(a.id) && !annMap.has(a.id)) {
+            annMap.set(a.id, a);
+          }
+        });
+        const nextAnns = Array.from(annMap.values());
+        if (JSON.stringify(nextAnns) !== JSON.stringify(this.state.announcements)) {
+          this.state.announcements = nextAnns;
+          changed = true;
+        }
+
+        // Merge messages per channel by id
+        CHANNELS.forEach(ch => {
+          const localList = this.state.messages[ch.id] || [];
+          const remoteList = (remote.messages && remote.messages[ch.id]) || [];
+          const byId = new Map();
+          localList.forEach(m => { if (m && m.id && !delSet.has(m.id)) byId.set(m.id, m); });
+          remoteList.forEach(m => { if (m && m.id && !delSet.has(m.id)) byId.set(m.id, m); });
+          const mergedList = Array.from(byId.values());
+          if (JSON.stringify(mergedList) !== JSON.stringify(localList)) {
+            this.state.messages[ch.id] = mergedList;
+            changed = true;
+          }
+        });
+
+        // Merge homework & attendance if remote is newer
+        if ((remote.updatedAt || 0) > (this.state.updatedAt || 0)) {
+          if (remote.homework && JSON.stringify(remote.homework) !== JSON.stringify(this.state.homework)) {
+            this.state.homework = { ...this.state.homework, ...remote.homework };
+            changed = true;
+          }
+          if (remote.attendance && JSON.stringify(remote.attendance) !== JSON.stringify(this.state.attendance)) {
+            this.state.attendance = { ...this.state.attendance, ...remote.attendance };
+            changed = true;
+          }
+          this.state.updatedAt = remote.updatedAt;
+        }
+
+        return changed;
       },
 
       me() {
@@ -3094,10 +3753,10 @@
         this.attDay = dayIndex;
 
         LoginModule.init();
-        SyncService.init();
+        SyncEngine.init();
         this.bindEvents();
 
-        const savedUid = SafeStorage.get('egruppa_epp26_v2_uid', null);
+        const savedUid = SafeStorage.get('egruppa_epp26_v3_uid', null);
         if (savedUid && this.state.students.some(s => s.id === savedUid)) {
           this.currentUserId = savedUid;
           this.openWorkspace();
@@ -3286,12 +3945,14 @@
       openWorkspace() {
         document.getElementById('loginView').style.display = 'none';
         document.getElementById('appView').style.display = 'block';
+        SyncEngine.publishPresence(true);
         this.renderAll();
       },
 
       logout() {
-        SafeStorage.remove('egruppa_epp26_v2_uid');
+        SafeStorage.remove('egruppa_epp26_v3_uid');
         this.currentUserId = null;
+        SyncEngine.publishPresence(true);
         document.getElementById('appView').style.display = 'none';
         document.getElementById('loginView').style.display = 'flex';
         Toast.show('Ви вийшли з кабінету', '👋');
@@ -3413,17 +4074,18 @@
         const u = this.me();
         const d = new Date();
         const dateStr = `${String(d.getDate()).padStart(2, '0')}.${String(d.getMonth() + 1).padStart(2, '0')}.${d.getFullYear()}`;
-
-        this.state.announcements.unshift({
-          id: 'ann_' + Date.now(),
+        const annObj = {
+          id: 'ann_' + Date.now() + '_' + Math.random().toString(36).slice(2, 5),
           title: title.trim(),
           body: body.trim(),
           author: u.name,
           role: u.role,
           date: dateStr
-        });
+        };
 
-        this.saveState();
+        this.state.announcements.unshift(annObj);
+
+        this.saveState('ANN_ADD', { announcement: annObj });
         this.renderHomeAnnouncements();
         Toast.show('Оголошення додано', '📢');
       },
@@ -3436,8 +4098,9 @@
           okLabel: 'Видалити →'
         });
         if (!ok) return;
+        this.trackDeleted(id);
         this.state.announcements = this.state.announcements.filter(a => a.id !== id);
-        this.saveState();
+        this.saveState('ANN_DELETE', { id });
         this.renderHomeAnnouncements();
         Toast.show('Оголошення видалено', '🗑️');
       },
@@ -3556,7 +4219,7 @@
         } else {
           delete this.state.homework[hwKey];
         }
-        this.saveState();
+        this.saveState('HW_SET', { hwKey, text: trimmed });
         this.renderScheduleTab();
         Toast.show('Домашнє завдання збережено', '📚');
       },
@@ -3659,17 +4322,19 @@
         const t = `${String(now.getHours()).padStart(2, '0')}:${String(now.getMinutes()).padStart(2, '0')}`;
         if (!this.state.messages[this.activeChannel]) this.state.messages[this.activeChannel] = [];
 
-        this.state.messages[this.activeChannel].push({
-          id: 'm_' + Date.now() + '_' + Math.random().toString(36).slice(2, 5),
+        const msgObj = {
+          id: 'm_' + Date.now() + '_' + Math.random().toString(36).slice(2, 6),
           userId: u.id,
           text: text || '',
           stickerId: stickerId || null,
           time: t,
           reactions: {},
           pinned: false
-        });
+        };
 
-        this.saveState();
+        this.state.messages[this.activeChannel].push(msgObj);
+
+        this.saveState('CHAT_ADD', { channel: this.activeChannel, message: msgObj });
         this.renderChatTab();
       },
 
@@ -3687,7 +4352,7 @@
         const idx = m.reactions[emoji].indexOf(this.currentUserId);
         if (idx >= 0) m.reactions[emoji].splice(idx, 1);
         else m.reactions[emoji].push(this.currentUserId);
-        this.saveState();
+        this.saveState('CHAT_REACT', { channel: this.activeChannel, msgId, reactions: m.reactions });
         this.renderChatTab();
       },
 
@@ -3699,7 +4364,7 @@
         const next = !target.pinned;
         msgs.forEach(x => { x.pinned = false; });
         target.pinned = next;
-        this.saveState();
+        this.saveState('CHAT_PIN', { channel: this.activeChannel, msgId, pinned: next });
         this.renderChatTab();
         Toast.show(next ? 'Повідомлення закріплено' : 'Повідомлення відкріплено', '📌');
       },
@@ -3718,8 +4383,9 @@
         });
         if (!ok) return;
 
+        this.trackDeleted(msgId);
         this.state.messages[this.activeChannel] = msgs.filter(x => x.id !== msgId);
-        this.saveState();
+        this.saveState('CHAT_DELETE', { channel: this.activeChannel, msgId });
         this.renderChatTab();
         Toast.show('Повідомлення видалено', '🗑️');
       },
@@ -3803,12 +4469,14 @@
         if (!this.canManage()) return;
         const k = this.attKey();
         if (!this.state.attendance[k]) this.state.attendance[k] = {};
+        let nextStatus = null;
         if (this.state.attendance[k][uid] === status) {
           delete this.state.attendance[k][uid];
         } else {
           this.state.attendance[k][uid] = status;
+          nextStatus = status;
         }
-        this.saveState();
+        this.saveState('ATT_SET', { attKey: k, uid, status: nextStatus });
         this.renderAttendanceTab();
       },
 
@@ -3819,15 +4487,16 @@
         this.state.students.forEach(s => {
           this.state.attendance[k][s.id] = 'present';
         });
-        this.saveState();
+        this.saveState('ATT_BULK', { attKey: k, records: this.state.attendance[k] });
         this.renderAttendanceTab();
         Toast.show('Усіх студентів відмічено: Був', '✅');
       },
 
       clearPairAttendance() {
         if (!this.canManage()) return;
-        delete this.state.attendance[this.attKey()];
-        this.saveState();
+        const k = this.attKey();
+        delete this.state.attendance[k];
+        this.saveState('ATT_BULK', { attKey: k, records: null });
         this.renderAttendanceTab();
         Toast.show('Відмітки очищено', '↺');
       },
@@ -3897,7 +4566,8 @@
             canvas.getContext('2d').drawImage(img, 0, 0, w, h);
             const u = this.me();
             u.photo = canvas.toDataURL('image/jpeg', 0.84);
-            this.saveState();
+            u.updatedAt = Date.now();
+            this.saveState('STUDENT_PATCH', { uid: u.id, patch: { photo: u.photo, updatedAt: u.updatedAt } });
             this.renderStudentIdTab();
             Toast.show('Фото додано до студентського', '🪪');
           };
@@ -3909,7 +4579,8 @@
       clearPhoto() {
         const u = this.me();
         u.photo = null;
-        this.saveState();
+        u.updatedAt = Date.now();
+        this.saveState('STUDENT_PATCH', { uid: u.id, patch: { photo: null, updatedAt: u.updatedAt } });
         this.renderStudentIdTab();
         Toast.show('Повернуто 3D-стікер на квитку', '✨');
       },
@@ -3959,7 +4630,8 @@
         const target = this.state.students.find(s => s.id === uid);
         if (!target) return;
         target.role = newRole;
-        this.saveState();
+        target.updatedAt = Date.now();
+        this.saveState('STUDENT_PATCH', { uid: target.id, patch: { role: newRole, updatedAt: target.updatedAt } });
         this.renderAll();
         Toast.show(`Оновлено роль: ${target.name}`, '🛡️');
       },
@@ -4013,14 +4685,16 @@
 
         const fbInp = document.getElementById('firebase-db-url');
         if (fbInp && document.activeElement !== fbInp) {
-          fbInp.value = SyncService.getUrl();
+          fbInp.value = SyncEngine.getUrl();
         }
+        SyncEngine.updateStatusUI();
       },
 
       pickSticker(stickerId) {
         const u = this.me();
         u.sticker = stickerId;
-        this.saveState();
+        u.updatedAt = Date.now();
+        this.saveState('STUDENT_PATCH', { uid: u.id, patch: { sticker: stickerId, updatedAt: u.updatedAt } });
         this.renderAll();
         Toast.show('Стікер профілю оновлено', '✨');
       },
@@ -4029,7 +4703,8 @@
         const val = document.getElementById('set-status-input').value.trim();
         const u = this.me();
         u.status = val || 'Група ЕПП 26 2/9 | ЗЕТФК';
-        this.saveState();
+        u.updatedAt = Date.now();
+        this.saveState('STUDENT_PATCH', { uid: u.id, patch: { status: u.status, updatedAt: u.updatedAt } });
         this.renderAll();
         Toast.show('Статус оновлено', '✅');
       },
@@ -4054,7 +4729,8 @@
         }
 
         u.password = newP;
-        this.saveState();
+        u.updatedAt = Date.now();
+        this.saveState('STUDENT_PATCH', { uid: u.id, patch: { password: newP, updatedAt: u.updatedAt } });
         document.getElementById('set-old-pass').value = '';
         document.getElementById('set-new-pass').value = '';
         document.getElementById('set-conf-pass').value = '';
@@ -4084,18 +4760,30 @@
 
       async connectFirebase() {
         const url = document.getElementById('firebase-db-url').value.trim();
-        SyncService.setUrl(url);
+        SyncEngine.setUrl(url);
         if (!url) {
           Toast.show('Посилання бази очищено', '🔄');
           return;
         }
-        const ok = await SyncService.pull(false);
+        const ok = await SyncEngine.pullFirebase(false);
         if (ok) {
-          await SyncService.push(this.state);
-          Toast.show('Синхронізацію підключено', '☁️');
+          await SyncEngine.pushFirebase(this.state);
+          Toast.show('Firebase синхронізацію підключено', '☁️');
         } else {
           Toast.show('Перевірте коректність URL бази даних', '⚠️');
         }
+      },
+
+      async manualSync() {
+        SyncEngine.publishPresence(true);
+        SyncEngine.publishSnapshot();
+        if (!SyncEngine.connected) {
+          SyncEngine.connectMqtt();
+        }
+        if (SyncEngine.getUrl()) {
+          await SyncEngine.pullFirebase(false);
+        }
+        Toast.show('Синхронізацію виконано', '🔄');
       },
 
       async manualSync() {
